@@ -54,6 +54,8 @@ nonisolated struct PendingFileInfo: Codable {
     let filePath: String
     let timestamp: Int64
     var retryCount: Int = 0
+    var retryAfter: Date?
+    var rejectedHTTPStatus: Int?
 }
 
 nonisolated struct DailyStatistics: Codable {

@@ -8,88 +8,145 @@ import Network
 final class MonitoringManager: ObservableObject {
     static let shared = MonitoringManager()
     @Published var isMonitoring = false
+    @Published private(set) var isPaused = false
     @Published var filesSent = 0
     @Published var pendingQueueSize = 0
     @Published var hasInternet = true
     @Published var monitoringTime = 0
     @Published var lastResult: UploadResponse?
     @Published var errorMessage: String?
+    @Published private(set) var uploadError: String?
+    @Published private(set) var lastUploadAt: Date?
+    @Published private(set) var rejectedQueueSize = 0
+    @Published private(set) var rejectedHTTPStatus: Int?
 
     private var engine: AVAudioEngine?
-    private let writer = AudioChunkWriter()
+    private var writer = AudioChunkWriter()
     private var currentInputFormat: AVAudioFormat?
     private var chunkTimer: Timer?
     private var uptimeTimer: Timer?
     private var saveTimer: Timer?
     private var retryTimer: Timer?
+    private var uploadRetryAfter: Date?
+    private var retryOnNetworkRecovery = false
     private var sessionStart: Date?
+    private var previousMonitoringTime = 0
     private var lastMonitoringSave = Date()
     private var task: URLSessionDataTask?
     private var generation = UUID()
+    private var audioGeneration = UUID()
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var backgroundTaskToken: UUID?
+    private let uploadSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 45
+        return URLSession(configuration: configuration)
+    }()
     private let networkMonitor = NWPathMonitor()
     private let networkQueue = DispatchQueue(label: "CoughScan.Network")
     private var observers: [NSObjectProtocol] = []
 
     private init() {
         recoverChunks()
-        pendingQueueSize = CoughStorage.shared.pendingQueue.count
+        updateQueueCounts(CoughStorage.shared.pendingQueue)
         networkMonitor.pathUpdateHandler = { [weak self] path in
             DispatchQueue.main.async {
-                self?.hasInternet = path.status == .satisfied
-                if path.status == .satisfied { self?.processQueue() }
+                guard let self else { return }
+                let available = path.status == .satisfied
+                if available && !self.hasInternet && self.retryOnNetworkRecovery {
+                    self.uploadRetryAfter = nil
+                    self.retryOnNetworkRecovery = false
+                }
+                self.hasInternet = available
+                self.processQueue()
             }
         }
         networkMonitor.start(queue: networkQueue)
-        for name in [UIApplication.didEnterBackgroundNotification, UIApplication.didBecomeActiveNotification] {
+        for name in [UIApplication.didEnterBackgroundNotification, UIApplication.didBecomeActiveNotification,
+                     UIApplication.protectedDataDidBecomeAvailableNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                DispatchQueue.main.async { self?.processQueue() }
+                DispatchQueue.main.async {
+                    self?.processQueue()
+                    if name == UIApplication.didBecomeActiveNotification {
+                        self?.resumeAfterInterruption()
+                    }
+                }
             })
         }
-        for name in [AVAudioSession.interruptionNotification, AVAudioSession.routeChangeNotification,
-                     AVAudioSession.mediaServicesWereResetNotification] {
+        let session = AVAudioSession.sharedInstance()
+        observers.append(NotificationCenter.default.addObserver(
+            forName: AVAudioSession.didBecomeInactiveNotification, object: session, queue: .main
+        ) { [weak self] notification in
+            guard let context = notification.userInfo?[AVAudioSession.deactivationContextKey]
+                    as? AVAudioSession.DeactivationContext, context.source == .system else { return }
+            DispatchQueue.main.async { self?.pauseForInterruption() }
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: AVAudioSession.resumptionRecommendationNotification, object: session, queue: .main
+        ) { [weak self] notification in
+            guard let context = notification.userInfo?[AVAudioSession.resumptionContextKey]
+                    as? AVAudioSession.ResumptionContext, context.recommendation == .shouldResume else { return }
+            DispatchQueue.main.async { self?.resumeAfterInterruption() }
+        })
+        for name in [AVAudioSession.routeChangeNotification, AVAudioSession.mediaServicesWereResetNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
                 if notification.name == AVAudioSession.routeChangeNotification {
                     let reason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
                     guard reason == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue ||
                           reason == AVAudioSession.RouteChangeReason.newDeviceAvailable.rawValue else { return }
                 }
-                if notification.name == AVAudioSession.interruptionNotification {
-                    guard notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt == AVAudioSession.InterruptionType.began.rawValue else { return }
-                }
                 DispatchQueue.main.async {
-                    guard let self, self.isMonitoring else { return }
+                    guard let self else { return }
+                    if name == AVAudioSession.routeChangeNotification {
+                        guard self.isMonitoring else { return }
+                        self.pauseForInterruption()
+                        self.resumeAfterInterruption()
+                        return
+                    }
+                    guard self.isMonitoring || self.isPaused else { return }
                     self.stop()
-                    self.errorMessage = "Запись прервана изменением аудиосессии. Запустите мониторинг снова."
+                    self.errorMessage = "Аудиосистема перезапустилась. Запустите мониторинг снова."
                 }
             })
         }
     }
 
     func start() {
-        guard !isMonitoring else { return }
+        guard !isMonitoring, !isPaused else { return }
+        previousMonitoringTime = 0
+        monitoringTime = 0
+        startAudio(resuming: false)
+    }
+
+    private func startAudio(resuming: Bool) {
         errorMessage = nil
+        let token = UUID()
+        audioGeneration = token
+        var sessionActivated = false
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playAndRecord, mode: .measurement,
                 options: [.defaultToSpeaker, .allowBluetoothHFP, .mixWithOthers])
             try session.setActive(true)
+            sessionActivated = true
             let engine = AVAudioEngine()
             let format = engine.inputNode.outputFormat(forBus: 0)
             guard format.sampleRate > 0, format.channelCount > 0 else {
                 throw NSError(domain: "CoughScan.Audio", code: 2,
                     userInfo: [NSLocalizedDescriptionKey: "Микрофон недоступен"])
             }
+            let writer = AudioChunkWriter()
             try writer.open(format: format)
+            self.writer = writer
             self.engine = engine
             currentInputFormat = format
-            let writer = self.writer
             engine.inputNode.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
                 do { try writer.write(buffer) }
                 catch {
                     let message = error.localizedDescription
                     DispatchQueue.main.async {
-                        guard let self, self.isMonitoring else { return }
+                        guard let self, self.isMonitoring, self.audioGeneration == token else { return }
                         self.stop()
                         self.errorMessage = "Ошибка записи: \(message)"
                     }
@@ -97,17 +154,18 @@ final class MonitoringManager: ObservableObject {
             }
             engine.prepare()
             try engine.start()
+            isPaused = false
             isMonitoring = true
-            sessionStart = Date()
-            lastMonitoringSave = Date()
-            monitoringTime = 0
+            let now = Date()
+            sessionStart = now
+            lastMonitoringSave = now
             chunkTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.rotateChunk() }
             }
             uptimeTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self, let start = self.sessionStart else { return }
-                    self.monitoringTime = Int(Date().timeIntervalSince(start))
+                    self.monitoringTime = self.previousMonitoringTime + max(0, Int(Date().timeIntervalSince(start)))
                 }
             }
             saveTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
@@ -115,31 +173,59 @@ final class MonitoringManager: ObservableObject {
             }
             processQueue()
         } catch {
-            stopAudio()
+            stopAudio(deactivate: sessionActivated)
             enqueueClosedChunk()
-            errorMessage = "Не удалось запустить запись: \(error.localizedDescription)"
+            let action = resuming ? "возобновить" : "запустить"
+            errorMessage = "Не удалось \(action) запись: \(error.localizedDescription)"
+            processQueue()
         }
     }
 
     func stop() {
-        guard isMonitoring else { return }
-        chunkTimer?.invalidate(); chunkTimer = nil
-        uptimeTimer?.invalidate(); uptimeTimer = nil
-        saveTimer?.invalidate(); saveTimer = nil
-        stopAudio()
-        enqueueClosedChunk()
-        saveElapsedMonitoring()
-        isMonitoring = false
-        sessionStart = nil
+        guard isMonitoring || isPaused else { return }
+        isPaused = false
+        errorMessage = nil
+        if isMonitoring { finishRecordingSegment(deactivate: true) }
         processQueue()
     }
 
-    private func stopAudio() {
+    private func pauseForInterruption() {
+        guard isMonitoring else { return }
+        isPaused = true
+        finishRecordingSegment(deactivate: false)
+        processQueue()
+    }
+
+    private func resumeAfterInterruption() {
+        guard isPaused, UserDefaults.standard.bool(forKey: "audio_upload_consent") else { return }
+        startAudio(resuming: true)
+    }
+
+    private func finishRecordingSegment(deactivate: Bool) {
+        let endedAt = Date()
+        if let start = sessionStart {
+            previousMonitoringTime += max(0, Int(endedAt.timeIntervalSince(start)))
+        }
+        monitoringTime = previousMonitoringTime
+        isMonitoring = false
+        sessionStart = nil
+        stopAudio(deactivate: deactivate)
+        enqueueClosedChunk()
+        saveElapsedMonitoring(until: endedAt)
+    }
+
+    private func stopAudio(deactivate: Bool = true) {
+        audioGeneration = UUID()
+        chunkTimer?.invalidate(); chunkTimer = nil
+        uptimeTimer?.invalidate(); uptimeTimer = nil
+        saveTimer?.invalidate(); saveTimer = nil
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
         currentInputFormat = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        if deactivate {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
 
     private func enqueueClosedChunk() {
@@ -147,11 +233,15 @@ final class MonitoringManager: ObservableObject {
         var queue = CoughStorage.shared.pendingQueue
         queue.append(PendingFileInfo(filePath: url.path, timestamp: timestamp))
         CoughStorage.shared.pendingQueue = queue
-        pendingQueueSize = queue.count
+        updateQueueCounts(queue)
     }
 
     private func rotateChunk() {
         guard isMonitoring, let format = currentInputFormat else { return }
+        guard engine?.isRunning == true else {
+            pauseForInterruption()
+            return
+        }
         enqueueClosedChunk()
         do { try writer.open(format: format) }
         catch {
@@ -166,10 +256,10 @@ final class MonitoringManager: ObservableObject {
         generation = UUID()
         task?.cancel(); task = nil
         retryTimer?.invalidate(); retryTimer = nil
+        uploadRetryAfter = nil
+        retryOnNetworkRecovery = false
+        isPaused = false
         if isMonitoring {
-            chunkTimer?.invalidate(); chunkTimer = nil
-            uptimeTimer?.invalidate(); uptimeTimer = nil
-            saveTimer?.invalidate(); saveTimer = nil
             stopAudio()
             _ = writer.close()
             isMonitoring = false
@@ -177,16 +267,18 @@ final class MonitoringManager: ObservableObject {
         }
         endBackgroundTask()
         CoughStorage.shared.clearAllData()
-        pendingQueueSize = 0; filesSent = 0; monitoringTime = 0
+        updateQueueCounts([])
+        filesSent = 0; monitoringTime = 0
         lastResult = nil; errorMessage = nil
+        uploadError = nil; lastUploadAt = nil
     }
 
     private func recoverChunks() {
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        var queue = CoughStorage.shared.pendingQueue.compactMap { item -> PendingFileInfo? in
+        var queue = CoughStorage.shared.pendingQueue.map { item -> PendingFileInfo in
             let url = dir.appendingPathComponent(URL(fileURLWithPath: item.filePath).lastPathComponent)
-            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-            return PendingFileInfo(filePath: url.path, timestamp: item.timestamp, retryCount: item.retryCount)
+            return PendingFileInfo(filePath: url.path, timestamp: item.timestamp, retryCount: item.retryCount,
+                                   retryAfter: item.retryAfter, rejectedHTTPStatus: item.rejectedHTTPStatus)
         }
         let known = Set(queue.map { URL(fileURLWithPath: $0.filePath).lastPathComponent })
         for url in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [] {
@@ -201,70 +293,136 @@ final class MonitoringManager: ObservableObject {
         CoughStorage.shared.pendingQueue = queue.sorted { $0.timestamp < $1.timestamp }
     }
 
-    private func processQueue() {
-        guard UserDefaults.standard.bool(forKey: "audio_upload_consent"), task == nil, retryTimer == nil, hasInternet else { return }
-        var queue = CoughStorage.shared.pendingQueue
-        while let first = queue.first, !FileManager.default.fileExists(atPath: first.filePath) {
-            queue.removeFirst()
+    private func updateQueueCounts(_ queue: [PendingFileInfo]) {
+        let rejected = queue.filter { $0.rejectedHTTPStatus != nil }
+        let pending = queue.count - rejected.count
+        if pendingQueueSize != pending { pendingQueueSize = pending }
+        if rejectedQueueSize != rejected.count { rejectedQueueSize = rejected.count }
+        if rejectedHTTPStatus != rejected.last?.rejectedHTTPStatus {
+            rejectedHTTPStatus = rejected.last?.rejectedHTTPStatus
         }
-        CoughStorage.shared.pendingQueue = queue
-        pendingQueueSize = queue.count
-        guard let item = queue.first else { endBackgroundTask(); return }
-        let currentGeneration = generation
-        if backgroundTask == .invalid {
-            backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "UploadQueue") { [weak self] in
-                DispatchQueue.main.async { self?.endBackgroundTask() }
-            }
-        }
-        do {
-            let request = try makeRequest(item)
-            task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-                let result: Result<UploadResponse, Error>
-                do {
-                    if let error { throw error }
-                    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), let data else {
-                        throw URLError(.badServerResponse)
-                    }
-                    result = .success(try UploadResponse.decodeServerResponse(data))
-                } catch { result = .failure(error) }
-                DispatchQueue.main.async {
-                    guard let self, self.generation == currentGeneration else { return }
-                    self.task = nil
-                    self.handleUpload(result, item: item)
-                }
-            }
-            task?.resume()
-        } catch { handleUpload(.failure(error), item: item) }
     }
 
-    private func handleUpload(_ result: Result<UploadResponse, Error>, item: PendingFileInfo) {
+    func retryRejectedUploads() {
         var queue = CoughStorage.shared.pendingQueue
-        guard let index = queue.firstIndex(where: { $0.filePath == item.filePath }) else { return }
+        for index in queue.indices where queue[index].rejectedHTTPStatus != nil {
+            queue[index].rejectedHTTPStatus = nil
+            queue[index].retryCount = 0
+            queue[index].retryAfter = nil
+        }
+        CoughStorage.shared.pendingQueue = queue
+        updateQueueCounts(queue)
+        processQueue()
+    }
+
+    private func processQueue() {
+        guard task == nil else { return }
+        guard UserDefaults.standard.bool(forKey: "audio_upload_consent"), hasInternet else {
+            retryTimer?.invalidate(); retryTimer = nil
+            endBackgroundTask()
+            return
+        }
+        let queue = CoughStorage.shared.pendingQueue
+        let now = Date()
+        let selection = PendingFileInfo.nextUpload(in: queue, at: now, serverRetryAfter: uploadRetryAfter)
+        guard let item = selection.item else {
+            endBackgroundTask()
+            scheduleUploadRetry(at: selection.retryAt)
+            return
+        }
+        scheduleUploadRetry(at: nil)
+
+        let request: URLRequest
+        do {
+            request = try makeRequest(item)
+        } catch {
+            if let cocoa = error as? CocoaError, cocoa.code == .fileReadNoSuchFile,
+               UIApplication.shared.isProtectedDataAvailable {
+                let remaining = queue.filter { $0.filePath != item.filePath }
+                CoughStorage.shared.pendingQueue = remaining
+                updateQueueCounts(remaining)
+                uploadError = "Файл записи не найден на устройстве."
+                DispatchQueue.main.async { [weak self] in self?.processQueue() }
+            } else {
+                handleUpload(.failure(.localRead), item: item)
+            }
+            return
+        }
+
+        if backgroundTask == .invalid {
+            let token = UUID()
+            backgroundTaskToken = token
+            backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "UploadQueue") { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self, self.backgroundTaskToken == token else { return }
+                    self.task?.cancel()
+                    self.endBackgroundTask()
+                }
+            }
+        }
+        let currentGeneration = generation
+        task = uploadSession.dataTask(with: request) { [weak self] data, response, error in
+            let result = UploadResponse.uploadResult(data: data, response: response, error: error)
+            DispatchQueue.main.async {
+                guard let self, self.generation == currentGeneration else { return }
+                self.task = nil
+                self.handleUpload(result, item: item)
+            }
+        }
+        task?.resume()
+    }
+
+    private func scheduleUploadRetry(at date: Date?) {
+        if let date, retryTimer?.fireDate == date { return }
+        retryTimer?.invalidate()
+        retryTimer = nil
+        guard let date else { return }
+        let timer = Timer(fire: date, interval: 0, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.retryTimer = nil
+                self?.processQueue()
+            }
+        }
+        retryTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func handleUpload(_ result: Result<UploadResponse, UploadFailure>, item: PendingFileInfo) {
+        var queue = CoughStorage.shared.pendingQueue
+        guard let index = queue.firstIndex(where: { $0.filePath == item.filePath }) else {
+            processQueue()
+            return
+        }
         switch result {
         case .success(let response):
             CoughStorage.shared.saveCoughRecord(timestamp: item.timestamp, probability: response.probability,
                 coughDetected: response.coughDetected, coughCount: response.coughCount)
             queue.remove(at: index)
-            CoughStorage.shared.pendingQueue = queue
             try? FileManager.default.removeItem(atPath: item.filePath)
             filesSent += 1
             lastResult = response
-            errorMessage = nil
-            pendingQueueSize = queue.count
-            processQueue()
-        case .failure(let error):
-            queue[index].retryCount = min(queue[index].retryCount + 1, 1000)
-            CoughStorage.shared.pendingQueue = queue
-            errorMessage = "Отправка отложена: \(error.localizedDescription). Записи сохранены на устройстве."
-            let delay = min(60.0, pow(2.0, Double(min(queue[index].retryCount, 6))))
-            endBackgroundTask()
-            retryTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    self?.retryTimer = nil
-                    self?.processQueue()
-                }
+            lastUploadAt = Date()
+            uploadError = nil
+            uploadRetryAfter = nil
+            retryOnNetworkRecovery = false
+        case .failure(let failure):
+            let now = Date()
+            if let rejection = failure.rejectedHTTPStatus {
+                queue[index].rejectedHTTPStatus = rejection
+                queue[index].retryAfter = nil
+            } else {
+                queue[index].retryCount = min(queue[index].retryCount + 1, 1000)
+                let delay = min(60.0, pow(2.0, Double(min(queue[index].retryCount, 6))))
+                queue[index].retryAfter = now.addingTimeInterval(delay)
+                uploadRetryAfter = failure.serverRetryDate(now: now, itemDelay: delay)
+                if case .network = failure { retryOnNetworkRecovery = true }
+                else { retryOnNetworkRecovery = false }
+                uploadError = "Отправка отложена: \(failure.localizedDescription). Записи сохранены."
             }
         }
+        CoughStorage.shared.pendingQueue = queue
+        updateQueueCounts(queue)
+        DispatchQueue.main.async { [weak self] in self?.processQueue() }
     }
 
     private func makeRequest(_ item: PendingFileInfo) throws -> URLRequest {
@@ -287,14 +445,14 @@ final class MonitoringManager: ObservableObject {
     }
 
     private func endBackgroundTask() {
+        backgroundTaskToken = nil
         if backgroundTask != .invalid {
             UIApplication.shared.endBackgroundTask(backgroundTask)
             backgroundTask = .invalid
         }
     }
 
-    private func saveElapsedMonitoring() {
-        let now = Date()
+    private func saveElapsedMonitoring(until now: Date = Date()) {
         // Split time at midnight and retain the fractional remainder.
         while lastMonitoringSave < now {
             let midnight = Calendar.current.startOfDay(for: lastMonitoringSave)

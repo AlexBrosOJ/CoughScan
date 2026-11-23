@@ -4,16 +4,20 @@ import Foundation
 // The audio callback and main-thread rotation must never access a file concurrently.
 nonisolated final class AudioChunkWriter: @unchecked Sendable {
     private let lock = NSLock()
+    private let directory: URL
     private var file: AVAudioFile?
     private var url: URL?
     private var timestamp: Int64 = 0
     private var frames: AVAudioFramePosition = 0
 
+    init(directory: URL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]) {
+        self.directory = directory
+    }
+
     func open(format: AVAudioFormat) throws {
         lock.lock(); defer { lock.unlock() }
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-        let destination = dir.appendingPathComponent("chunk_\(timestamp)_\(UUID().uuidString).wav")
+        let destination = directory.appendingPathComponent("chunk_\(timestamp)_\(UUID().uuidString).wav")
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: format.sampleRate,
             AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16,

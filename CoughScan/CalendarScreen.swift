@@ -7,6 +7,7 @@ struct CalendarScreen: View {
     @State private var monthSummary: [Int: Int] = [:]
     @State private var dailyStats: DailyStatistics?
     @State private var slideEdge: Edge = .trailing
+    @ScaledMetric(relativeTo: .callout) private var dayCellHeight: CGFloat = 36
 
     private let calendar: Calendar = {
         var cal = Calendar(identifier: .gregorian)
@@ -80,7 +81,8 @@ struct CalendarScreen: View {
                         if let day {
                             dayCell(day)
                         } else {
-                            Color.clear.aspectRatio(1, contentMode: .fit)
+                            Color.clear.frame(height: dayCellHeight)
+                                .accessibilityHidden(true)
                         }
                     }
                 }
@@ -131,18 +133,21 @@ struct CalendarScreen: View {
                 Text("\(day)")
                     .font(.callout.weight(isToday || isSelected ? .bold : .medium))
                     .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.5)
                 if let coughs, coughs > 0 {
                     Text("\(coughs)")
                         .font(.system(size: 9, weight: .bold, design: .rounded))
                         .foregroundStyle(isSelected ? .white.opacity(0.9) : Color.cough)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
                 } else if coughs != nil {
                     Circle().fill(isSelected ? Color.white.opacity(0.8) : Color.brand).frame(width: 4, height: 4)
                         .padding(.vertical, 3)
                 }
             }
             .foregroundStyle(isSelected ? .white : (isFuture ? Color.secondary.opacity(0.5) : Color.primary))
-            .frame(maxWidth: .infinity)
-            .aspectRatio(1, contentMode: .fit)
+            .frame(maxWidth: .infinity, minHeight: dayCellHeight)
             .background {
                 RoundedRectangle(cornerRadius: DS.Radius.small, style: .continuous)
                     .fill(isSelected ? AnyShapeStyle(Color.brand.gradient)

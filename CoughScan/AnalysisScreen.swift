@@ -13,6 +13,7 @@ struct AnalysisScreen: View {
     @State private var period: AnalysisPeriod = .week
     @State private var periodStats: PeriodStatistics?
     @State private var exportError: String?
+    @State private var showingExportFormats = false
 
     private let columns = [GridItem(.flexible(), spacing: DS.Spacing.s),
                            GridItem(.flexible(), spacing: DS.Spacing.s)]
@@ -45,16 +46,20 @@ struct AnalysisScreen: View {
             .toolbar {
                 if let s = periodStats, !s.dailyStats.isEmpty {
                     ToolbarItem(placement: .topBarTrailing) {
-                        Button(action: exportCSV) {
+                        Button { showingExportFormats = true } label: {
                             Image(systemName: "square.and.arrow.up")
                         }
-                        .accessibilityLabel("Экспорт в CSV")
+                        .accessibilityLabel("Экспорт отчёта")
                     }
                 }
             }
             .onAppear(perform: refreshStats)
             .onChange(of: period) { refreshStats() }
             .onReceive(NotificationCenter.default.publisher(for: CoughStorage.didChange)) { _ in refreshStats() }
+            .confirmationDialog("Формат отчёта", isPresented: $showingExportFormats, titleVisibility: .visible) {
+                Button("Excel (.xlsx)") { exportReport(excel: true) }
+                Button("CSV (.csv)") { exportReport(excel: false) }
+            }
             .alert("Не удалось экспортировать", isPresented: Binding(
                 get: { exportError != nil }, set: { if !$0 { exportError = nil } })) {
                 Button("OK", role: .cancel) {}
@@ -118,13 +123,13 @@ struct AnalysisScreen: View {
                 IconBadge(systemName: "doc.text.fill", tint: .brand, size: 40)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Отчёт для врача").font(.headline)
-                    Text("CSV с данными пациента, статистикой по дням и часам")
+                    Text("Данные пациента и статистика по дням и часам")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
             }
-            Button(action: exportCSV) {
-                Label("Экспортировать CSV", systemImage: "square.and.arrow.up")
+            Button { showingExportFormats = true } label: {
+                Label("Экспортировать отчёт", systemImage: "square.and.arrow.up")
             }
             .buttonStyle(.secondary)
             .padding(.top, DS.Spacing.xxs)
@@ -152,16 +157,19 @@ struct AnalysisScreen: View {
         withAnimation(.smooth) { periodStats = stats }
     }
 
-    private func exportCSV() {
+    private func exportReport(excel: Bool) {
         guard let stats = periodStats else { return }
         let patient = CoughStorage.shared.patientInfo
-        let csvString = stats.toCSV(patient: patient)
-
-        let fileName = "Кашель_\(UUID().uuidString).csv"
+        let ext = excel ? "xlsx" : "csv"
+        let fileName = "Кашель_\(UUID().uuidString).\(ext)"
         let path = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
 
         do {
-            try csvString.write(to: path, atomically: true, encoding: .utf8)
+            if excel {
+                try ExcelReport.data(stats: stats, patient: patient).write(to: path, options: .atomic)
+            } else {
+                try stats.toCSV(patient: patient).write(to: path, atomically: true, encoding: .utf8)
+            }
             let activityVC = UIActivityViewController(activityItems: [path], applicationActivities: nil)
             if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
                var top = windowScene.keyWindow?.rootViewController ?? windowScene.windows.first?.rootViewController {
@@ -275,30 +283,36 @@ enum ChartStyle {
 struct HourlyChartView: View {
     let hourlyCoughs: [Int]
     var height: CGFloat = 150
+    private let labeledHours: [Double] = [0, 6, 12, 18]
 
     private struct HourPoint: Identifiable {
-        let hour: String
+        let hour: Int
         let count: Int
         let isPeak: Bool
-        var id: String { hour }
+        var id: Int { hour }
     }
 
     private var points: [HourPoint] {
         let peak = hourlyCoughs.max() ?? 0
         return hourlyCoughs.enumerated().map {
-            HourPoint(hour: String(format: "%02d", $0.offset), count: $0.element,
+            HourPoint(hour: $0.offset, count: $0.element,
                       isPeak: peak > 0 && $0.element == peak)
         }
     }
 
     var body: some View {
         Chart(points) { (point: HourPoint) in
-            BarMark(x: .value("Час", point.hour),
-                    y: .value("Кашлей", point.count),
-                    width: .ratio(0.7))
+            let hour = Double(point.hour)
+            RectangleMark(xStart: .value("Начало столбца", hour - 0.35),
+                          xEnd: .value("Конец столбца", hour + 0.35),
+                          yStart: .value("Ноль", 0),
+                          yEnd: .value("Кашлей", point.count))
                 .foregroundStyle(Color.cough.opacity(point.isPeak ? 1 : 0.45).gradient)
                 .cornerRadius(3)
+                .accessibilityLabel(Text(String(format: "%02d:00", point.hour)))
+                .accessibilityValue(Text("\(point.count)"))
         }
+        .chartXScale(domain: -0.5...23.5)
         .chartXAxis { xAxis }
         .chartYAxis { ChartStyle.yAxis }
         .frame(height: height)
@@ -306,13 +320,14 @@ struct HourlyChartView: View {
     }
 
     private var xAxis: some AxisContent {
-        AxisMarks(values: ["00", "06", "12", "18"]) { (value: AxisValue) in
-            AxisValueLabel(anchor: .topLeading) {
-                if let h = value.as(String.self) {
-                    Text("\(h):00")
+        AxisMarks(values: labeledHours) { value in
+            if let hour = value.as(Double.self), labeledHours.contains(hour) {
+                AxisValueLabel {
+                    Text(String(format: "%02d:00", Int(hour)))
+                        .font(.caption2.monospacedDigit())
                 }
+                .foregroundStyle(Color.secondary)
             }
-            .foregroundStyle(Color.secondary)
         }
     }
 }

@@ -25,6 +25,18 @@ struct MonitoringScreen: View {
                     }
 
                     statusRow
+                    if let error = monitoring.uploadError {
+                        InlineBanner(systemImage: "arrow.up.circle", text: error, tint: .metricAmber)
+                    }
+                    if let code = monitoring.rejectedHTTPStatus {
+                        VStack(spacing: DS.Spacing.xs) {
+                            InlineBanner(systemImage: "tray.full", text:
+                                "Сервер отклонил файлов: \(monitoring.rejectedQueueSize). Последний код: HTTP \(code). Записи сохранены.",
+                                tint: .metricAmber)
+                            Button("Повторить отклонённые", action: monitoring.retryRejectedUploads)
+                                .font(.footnote.weight(.semibold))
+                        }
+                    }
                     todaySection
                     disclaimer
                 }
@@ -64,24 +76,24 @@ struct MonitoringScreen: View {
 
     private var heroCard: some View {
         VStack(spacing: DS.Spacing.l) {
-            StatusPill(text: monitoring.isMonitoring ? "Идёт запись" : "Готов к записи",
-                       systemImage: monitoring.isMonitoring ? "waveform" : "moon.zzz.fill",
-                       tint: monitoring.isMonitoring ? .recording : .secondary)
+            StatusPill(text: monitoring.isPaused ? "Запись на паузе" : (monitoring.isMonitoring ? "Идёт запись" : "Готов к записи"),
+                       systemImage: monitoring.isPaused ? "pause.fill" : (monitoring.isMonitoring ? "waveform" : "moon.zzz.fill"),
+                       tint: monitoring.isPaused ? .metricAmber : (monitoring.isMonitoring ? .recording : .secondary))
                 .symbolEffect(.variableColor.iterative, isActive: monitoring.isMonitoring)
                 .contentTransition(.opacity)
 
-            RecordButton(isActive: monitoring.isMonitoring, action: toggleMonitoring)
+            RecordButton(isActive: monitoring.isMonitoring || monitoring.isPaused, action: toggleMonitoring)
                 .padding(.vertical, DS.Spacing.xl)
 
             VStack(spacing: DS.Spacing.xxs) {
-                Text(formatClock(monitoring.isMonitoring ? monitoring.monitoringTime : 0))
+                Text(formatClock(monitoring.isMonitoring || monitoring.isPaused ? monitoring.monitoringTime : 0))
                     .font(.system(size: 44, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .contentTransition(.numericText(countsDown: false))
                     .foregroundStyle(.primary)
-                    .opacity(monitoring.isMonitoring ? 1 : 0.3)
+                    .opacity(monitoring.isMonitoring || monitoring.isPaused ? 1 : 0.3)
                     .accessibilityLabel("Длительность сессии \(formatTime(monitoring.monitoringTime))")
-                Text(monitoring.isMonitoring
+                Text(monitoring.isPaused ? "Ожидание доступа к микрофону" : monitoring.isMonitoring
                      ? "Можно заблокировать экран — запись продолжится"
                      : "Нажмите, чтобы начать отслеживать кашель")
                     .font(.subheadline)
@@ -103,7 +115,7 @@ struct MonitoringScreen: View {
         ScrollView(.horizontal) {
             HStack(spacing: DS.Spacing.xs) {
                 if monitoring.hasInternet {
-                    StatusPill(text: "Онлайн", systemImage: "wifi", tint: .success)
+                    StatusPill(text: "Сеть доступна", systemImage: "wifi", tint: .success)
                 } else {
                     StatusPill(text: "Нет сети", systemImage: "wifi.slash", tint: .metricAmber)
                 }
@@ -111,14 +123,18 @@ struct MonitoringScreen: View {
                 if monitoring.pendingQueueSize > 0 {
                     StatusPill(text: "В очереди: \(monitoring.pendingQueueSize)",
                                systemImage: "tray.full.fill", tint: .metricAmber)
-                } else {
+                } else if monitoring.rejectedQueueSize == 0 {
                     StatusPill(text: "Всё отправлено", systemImage: "checkmark.icloud.fill", tint: .success)
                 }
 
                 if let last = monitoring.lastResult {
-                    StatusPill(text: last.coughDetected ? "Последний: кашель" : "Последний: тихо",
+                    StatusPill(text: last.coughDetected ? "Последний: кашель" : "Последний: без кашля",
                                systemImage: last.coughDetected ? "lungs.fill" : "checkmark.circle.fill",
                                tint: last.coughDetected ? .cough : .secondary)
+                }
+                if let sentAt = monitoring.lastUploadAt {
+                    StatusPill(text: "Отправлено в \(sentAt.formatted(date: .omitted, time: .standard))",
+                               systemImage: "clock", tint: .secondary)
                 }
             }
             .padding(.horizontal, DS.Spacing.m)
@@ -181,7 +197,7 @@ struct MonitoringScreen: View {
     // MARK: Actions
 
     private func toggleMonitoring() {
-        if monitoring.isMonitoring {
+        if monitoring.isMonitoring || monitoring.isPaused {
             monitoring.stop()
         } else if uploadConsent {
             requestMicrophone()
